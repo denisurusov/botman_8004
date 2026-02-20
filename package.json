@@ -1,13 +1,20 @@
 {
   "name": "botman_8004",
   "version": "1.0.0",
-  "type": "module",
   "devDependencies": {
-    "@nomicfoundation/hardhat-ethers": "^4.0.4",
+    "@nomicfoundation/hardhat-ethers": "^3.0.8",
     "@openzeppelin/contracts": "^5.4.0",
+    "@openzeppelin/hardhat-upgrades": "^3.4.0",
+    "@openzeppelin/contracts-upgradeable": "^5.0.2",
     "@types/node": "^22.19.11",
-    "ethers": "^6.16.0",
-    "hardhat": "^3.1.9",
+    "ethers": "^6.13.2",
+    "hardhat": "^2.22.10",
+    "ts-node": "^10.9.2",
     "typescript": "~5.8.0"
+  },
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy": "hardhat run scripts/deploy-registries.js --network hardhat"
   }
 }
