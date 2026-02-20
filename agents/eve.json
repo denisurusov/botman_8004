@@ -1,0 +1,7 @@
+{
+  "name": "CodeReviewerEve",
+  "description": "Reviews Solidity code for bugs",
+  "capabilities": ["code-review", "solidity"],
+  "endpoint": "http://localhost:8001",
+  "image": "https://example.com/alice.png"
+}
