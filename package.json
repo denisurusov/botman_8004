@@ -1,0 +1,13 @@
+{
+  "name": "botman_8004",
+  "version": "1.0.0",
+  "type": "module",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ethers": "^4.0.4",
+    "@openzeppelin/contracts": "^5.4.0",
+    "@types/node": "^22.19.11",
+    "ethers": "^6.16.0",
+    "hardhat": "^3.1.9",
+    "typescript": "~5.8.0"
+  }
+}
