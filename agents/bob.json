@@ -2,6 +2,6 @@
   "name": "CodeReviewerBob",
   "description": "Reviews Solidity code for bugs",
   "capabilities": ["code-review", "solidity"],
-  "endpoint": "http://localhost:8001",
+  "endpoint": "http://localhost:8002",
   "image": "https://example.com/alice.png"
 }

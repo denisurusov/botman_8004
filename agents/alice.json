@@ -1,4 +1,5 @@
 {
+
   "name": "CodeReviewerAlice",
   "description": "Reviews Solidity code for bugs",
   "capabilities": ["code-review", "solidity"],

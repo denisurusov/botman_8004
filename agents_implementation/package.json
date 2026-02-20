@@ -1,0 +1,13 @@
+{
+  "name": "agents-implementation",
+  "version": "1.0.0",
+  "description": "MCP HTTP servers for agent cards",
+  "type": "module",
+  "scripts": {
+    "launch": "node launch-agents.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
+
