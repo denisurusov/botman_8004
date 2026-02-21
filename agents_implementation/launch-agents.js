@@ -2,8 +2,8 @@
  * launch-agents.js
  *
  * Reads every *.json file in the ../agents directory, extracts the port
- * from each card's `endpoint` field, then spawns a separate
- * "node server.js" process for each agent.
+ * from each card's `endpoint` field, then spawns the correct MCP server
+ * process for each agent based on its capabilities.
  *
  * Usage:
  *   node launch-agents.js [--base-port 9000]
