@@ -22,7 +22,8 @@ contract IdentityRegistryUpgradeable is
     /// @custom:storage-location erc7201:erc8004.identity.registry
     struct IdentityRegistryStorage {
         uint256 _lastId;
-        // agentId => metadataKey => metadataValue (includes "agentWallet")
+        // agentId => metadataKey => metadataValue
+        // Reserved keys: "agentWallet", "oracleAddress"
         mapping(uint256 => mapping(string => bytes)) _metadata;
     }
 
@@ -39,12 +40,16 @@ contract IdentityRegistryUpgradeable is
     event Registered(uint256 indexed agentId, string agentURI, address indexed owner);
     event MetadataSet(uint256 indexed agentId, string indexed indexedMetadataKey, string metadataKey, bytes metadataValue);
     event URIUpdated(uint256 indexed agentId, string newURI, address indexed updatedBy);
+    /// @notice Emitted when an oracle contract is bound to an agent identity.
+    event OracleAddressSet(uint256 indexed agentId, address indexed oracleAddress, address indexed setBy);
 
     bytes32 private constant AGENT_WALLET_SET_TYPEHASH =
     keccak256("AgentWalletSet(uint256 agentId,address newWallet,address owner,uint256 deadline)");
     bytes4 private constant ERC1271_MAGICVALUE = 0x1626ba7e;
     uint256 private constant MAX_DEADLINE_DELAY = 5 minutes;
-    bytes32 private constant RESERVED_AGENT_WALLET_KEY_HASH = keccak256("agentWallet");
+    bytes32 private constant RESERVED_AGENT_WALLET_KEY_HASH  = keccak256("agentWallet");
+    /// @dev Prevents oracleAddress being set/overwritten via generic setMetadata.
+    bytes32 private constant RESERVED_ORACLE_ADDRESS_KEY_HASH = keccak256("oracleAddress");
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -58,6 +63,10 @@ contract IdentityRegistryUpgradeable is
         __UUPSUpgradeable_init();
         __EIP712_init("ERC8004IdentityRegistry", "1");
     }
+
+    // -------------------------------------------------------------------------
+    // Registration
+    // -------------------------------------------------------------------------
 
     function register() external returns (uint256 agentId) {
         IdentityRegistryStorage storage $ = _getIdentityRegistryStorage();
@@ -88,11 +97,49 @@ contract IdentityRegistryUpgradeable is
         emit MetadataSet(agentId, "agentWallet", "agentWallet", abi.encodePacked(msg.sender));
 
         for (uint256 i; i < metadata.length; i++) {
-            require(keccak256(bytes(metadata[i].metadataKey)) != RESERVED_AGENT_WALLET_KEY_HASH, "reserved key");
+            _requireNotReserved(metadata[i].metadataKey);
             $._metadata[agentId][metadata[i].metadataKey] = metadata[i].metadataValue;
             emit MetadataSet(agentId, metadata[i].metadataKey, metadata[i].metadataKey, metadata[i].metadataValue);
         }
     }
+
+    /**
+     * @notice Register an agent with a URI, arbitrary metadata, and a bound oracle contract.
+     *         This is the canonical enterprise registration path — agent identity, card URI,
+     *         capability metadata, and on-chain oracle are all established in a single transaction.
+     * @param agentURI       URI pointing to the agent card (e.g. IPFS or HTTP endpoint).
+     * @param metadata       Arbitrary key/value metadata entries (reserved keys are rejected).
+     * @param oracleAddress  Address of the deployed oracle contract (CodeReviewerOracle /
+     *                       CodeApproverOracle) to bind to this agent identity.
+     */
+    function register(
+        string memory agentURI,
+        MetadataEntry[] memory metadata,
+        address oracleAddress
+    ) external returns (uint256 agentId) {
+        require(oracleAddress != address(0), "ERC8004: zero oracle address");
+
+        IdentityRegistryStorage storage $ = _getIdentityRegistryStorage();
+        agentId = $._lastId++;
+        $._metadata[agentId]["agentWallet"]    = abi.encodePacked(msg.sender);
+        $._metadata[agentId]["oracleAddress"]  = abi.encodePacked(oracleAddress);
+        _safeMint(msg.sender, agentId);
+        _setTokenURI(agentId, agentURI);
+
+        emit Registered(agentId, agentURI, msg.sender);
+        emit MetadataSet(agentId, "agentWallet",   "agentWallet",   abi.encodePacked(msg.sender));
+        emit OracleAddressSet(agentId, oracleAddress, msg.sender);
+
+        for (uint256 i; i < metadata.length; i++) {
+            _requireNotReserved(metadata[i].metadataKey);
+            $._metadata[agentId][metadata[i].metadataKey] = metadata[i].metadataValue;
+            emit MetadataSet(agentId, metadata[i].metadataKey, metadata[i].metadataKey, metadata[i].metadataValue);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Generic metadata
+    // -------------------------------------------------------------------------
 
     function getMetadata(uint256 agentId, string memory metadataKey) external view returns (bytes memory) {
         IdentityRegistryStorage storage $ = _getIdentityRegistryStorage();
@@ -107,7 +154,7 @@ contract IdentityRegistryUpgradeable is
             msg.sender == getApproved(agentId),
             "Not authorized"
         );
-        require(keccak256(bytes(metadataKey)) != RESERVED_AGENT_WALLET_KEY_HASH, "reserved key");
+        _requireNotReserved(metadataKey);
         IdentityRegistryStorage storage $ = _getIdentityRegistryStorage();
         $._metadata[agentId][metadataKey] = metadataValue;
         emit MetadataSet(agentId, metadataKey, metadataKey, metadataValue);
@@ -124,6 +171,10 @@ contract IdentityRegistryUpgradeable is
         _setTokenURI(agentId, newURI);
         emit URIUpdated(agentId, newURI, msg.sender);
     }
+
+    // -------------------------------------------------------------------------
+    // agentWallet — reserved typed field
+    // -------------------------------------------------------------------------
 
     function getAgentWallet(uint256 agentId) external view returns (address) {
         IdentityRegistryStorage storage $ = _getIdentityRegistryStorage();
@@ -174,35 +225,86 @@ contract IdentityRegistryUpgradeable is
             msg.sender == getApproved(agentId),
             "Not authorized"
         );
-
         IdentityRegistryStorage storage $ = _getIdentityRegistryStorage();
         $._metadata[agentId]["agentWallet"] = "";
         emit MetadataSet(agentId, "agentWallet", "agentWallet", "");
     }
 
+    // -------------------------------------------------------------------------
+    // oracleAddress — reserved typed field (ERC-8004 extension, Option A)
+    // -------------------------------------------------------------------------
+
+    /**
+     * @notice Returns the oracle contract address bound to this agent identity.
+     * @param agentId The agent token ID.
+     * @return The bound oracle address, or address(0) if none is set.
+     */
+    function getOracleAddress(uint256 agentId) external view returns (address) {
+        IdentityRegistryStorage storage $ = _getIdentityRegistryStorage();
+        bytes memory data = $._metadata[agentId]["oracleAddress"];
+        if (data.length == 0) return address(0);
+        return address(bytes20(data));
+    }
+
+    /**
+     * @notice Bind or update the oracle contract address for an agent.
+     *         Only the agent owner or an approved operator may call this.
+     *         Setting address(0) effectively unbinds the oracle.
+     * @param agentId       The agent token ID.
+     * @param oracleAddress The deployed oracle contract to bind.
+     */
+    function setOracleAddress(uint256 agentId, address oracleAddress) external {
+        address owner = ownerOf(agentId);
+        require(
+            msg.sender == owner ||
+            isApprovedForAll(owner, msg.sender) ||
+            msg.sender == getApproved(agentId),
+            "Not authorized"
+        );
+        IdentityRegistryStorage storage $ = _getIdentityRegistryStorage();
+        $._metadata[agentId]["oracleAddress"] = abi.encodePacked(oracleAddress);
+        emit OracleAddressSet(agentId, oracleAddress, msg.sender);
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal helpers
+    // -------------------------------------------------------------------------
+
+    /// @dev Reverts if the key is a reserved field that must not be set via generic setMetadata.
+    function _requireNotReserved(string memory metadataKey) internal pure {
+        bytes32 h = keccak256(bytes(metadataKey));
+        require(h != RESERVED_AGENT_WALLET_KEY_HASH,   "reserved key: agentWallet");
+        require(h != RESERVED_ORACLE_ADDRESS_KEY_HASH, "reserved key: oracleAddress");
+    }
+
     function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 
     /**
-     * @dev Override _update to clear agentWallet on transfer.
-     * This ensures the verified wallet doesn't persist to new owners.
-     * Clear BEFORE super._update() to follow Checks-Effects-Interactions pattern.
+     * @dev Override _update to clear both agentWallet and oracleAddress on transfer.
+     *      Verified wallet and oracle binding must not persist to new owners.
+     *      Cleared BEFORE super._update() to follow Checks-Effects-Interactions.
      */
     function _update(address to, uint256 tokenId, address auth) internal override returns (address) {
         address from = _ownerOf(tokenId);
 
-        // If this is a transfer (not mint), clear agentWallet BEFORE external call
         if (from != address(0) && to != address(0)) {
             IdentityRegistryStorage storage $ = _getIdentityRegistryStorage();
-            $._metadata[tokenId]["agentWallet"] = "";
-            emit MetadataSet(tokenId, "agentWallet", "agentWallet", "");
+            $._metadata[tokenId]["agentWallet"]   = "";
+            $._metadata[tokenId]["oracleAddress"] = "";
+            emit MetadataSet(tokenId, "agentWallet",   "agentWallet",   "");
+            emit OracleAddressSet(tokenId, address(0), msg.sender);
         }
 
         return super._update(to, tokenId, auth);
     }
 
+    // -------------------------------------------------------------------------
+    // Utility
+    // -------------------------------------------------------------------------
+
     /**
-     * @notice Checks if spender is owner or approved for the agent
-     * @dev Reverts with ERC721NonexistentToken if agent doesn't exist
+     * @notice Checks if spender is owner or approved for the agent.
+     * @dev Reverts with ERC721NonexistentToken if agent doesn't exist.
      */
     function isAuthorizedOrOwner(address spender, uint256 agentId) external view returns (bool) {
         address owner = ownerOf(agentId);
@@ -210,6 +312,6 @@ contract IdentityRegistryUpgradeable is
     }
 
     function getVersion() external pure returns (string memory) {
-        return "2.0.0";
+        return "3.0.0";
     }
 }

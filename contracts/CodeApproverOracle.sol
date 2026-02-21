@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "./IIdentityRegistry.sol";
+
 /**
  * @title CodeApproverOracle
  * @notice Monolithic on-chain request/response contract for the code-approver MCP agent type.
  *
+ * Authorization model (ERC-8004 Option A):
+ *   A caller may fulfill a request only if:
+ *     1. They are the agentWallet of a registered agent (agentId), AND
+ *     2. The oracleAddress bound to that agentId equals address(this).
+ *   Registration in the identity registry IS the oracle authorization.
+ *
  * Flow:
  *   1. Any caller calls requestApproval(prId, reviewerAgent, message) — emits ApprovalRequested.
- *   2. Off-chain MCP approver agent sees the event, reads reviewer comments (optionally from
- *      the companion CodeReviewerOracle), runs approve_pr or reject_pr, then calls back either
- *      fulfillApproval() or fulfillRejection().
- *   3. Decision is stored as raw JSON bytes and accessible via getDecision().
+ *   2. Off-chain MCP approver bridge sees the event, calls approve_pr on the MCP server,
+ *      then calls fulfillApproval / fulfillNeedsRevision / fulfillRejection.
+ *   3. Decision is stored as raw JSON bytes.
  *
- * Resources exposed on-chain (mirror of MCP resources):
- *   review://{pr_id}/comments    →  read from the CodeReviewerOracle (address set at construction)
+ * Resources:
  *   approval://{pr_id}/decision  →  approvalDecisions[prId]
- *
- * Authorization:
- *   Only addresses registered as oracles may call fulfill*.
- *   The contract owner manages the oracle set.
  */
 contract CodeApproverOracle {
 
@@ -31,21 +33,18 @@ contract CodeApproverOracle {
     struct ApprovalRequest {
         address requester;
         string  prId;
-        string  reviewerAgent;  // endpoint hint for the approver oracle
-        string  message;        // optional message from requester
+        string  reviewerAgent;
+        string  message;
         uint256 createdAt;
         RequestStatus status;
     }
 
     struct ApprovalResult {
         string  prId;
-        /// Raw JSON string — MCP outputSchema: decision enum value
         bytes   decision;
-        /// Raw JSON string — MCP outputSchema: reason
         bytes   reason;
-        /// Raw JSON array  — MCP outputSchema: unresolved_blockers[]
         bytes   unresolvedBlockers;
-        address oracle;
+        uint256 agentId;    // identity registry agentId of the fulfilling oracle
         uint256 fulfilledAt;
     }
 
@@ -54,13 +53,12 @@ contract CodeApproverOracle {
     // -------------------------------------------------------------------------
 
     address public owner;
-
-    mapping(address => bool) public isOracle;
+    IIdentityRegistry public identityRegistry;
 
     mapping(bytes32 => ApprovalRequest) public requests;
     mapping(bytes32 => ApprovalResult)  public results;
 
-    /// MCP resource: approval://{pr_id}/decision  (latest decision per PR)
+    /// MCP resource: approval://{pr_id}/decision
     mapping(string => bytes) public approvalDecisions;
 
     uint256 private _nonce;
@@ -69,7 +67,6 @@ contract CodeApproverOracle {
     // Events
     // -------------------------------------------------------------------------
 
-    /// Emitted when a caller requests an approval — oracle monitors this event.
     event ApprovalRequested(
         bytes32 indexed requestId,
         address indexed requester,
@@ -77,38 +74,27 @@ contract CodeApproverOracle {
         string  reviewerAgent,
         uint256 timestamp
     );
-
-    /// Emitted when the oracle approves a PR.
     event PRApproved(
         bytes32 indexed requestId,
         string  prId,
-        address oracle,
+        uint256 indexed agentId,
         uint256 timestamp
     );
-
-    /// Emitted when the oracle requests revisions.
     event RevisionRequested(
         bytes32 indexed requestId,
         string  prId,
         bytes   unresolvedBlockers,
-        address oracle,
+        uint256 indexed agentId,
         uint256 timestamp
     );
-
-    /// Emitted when the oracle rejects a PR outright.
     event PRRejected(
         bytes32 indexed requestId,
         string  prId,
         bytes   reason,
-        address oracle,
+        uint256 indexed agentId,
         uint256 timestamp
     );
-
-    /// Emitted when a request is cancelled.
     event ApprovalCancelled(bytes32 indexed requestId, string prId);
-
-    event OracleAdded(address indexed oracle);
-    event OracleRemoved(address indexed oracle);
 
     // -------------------------------------------------------------------------
     // Modifiers
@@ -119,8 +105,15 @@ contract CodeApproverOracle {
         _;
     }
 
-    modifier onlyOracle() {
-        require(isOracle[msg.sender], "CodeApproverOracle: not an authorised oracle");
+    modifier onlyRegisteredOracle(uint256 agentId) {
+        require(
+            identityRegistry.getAgentWallet(agentId) == msg.sender,
+            "CodeApproverOracle: caller is not the registered agentWallet"
+        );
+        require(
+            identityRegistry.getOracleAddress(agentId) == address(this),
+            "CodeApproverOracle: agentId not bound to this oracle"
+        );
         _;
     }
 
@@ -128,34 +121,21 @@ contract CodeApproverOracle {
     // Constructor
     // -------------------------------------------------------------------------
 
-    constructor() {
-        owner = msg.sender;
+    constructor(address identityRegistry_) {
+        require(identityRegistry_ != address(0), "CodeApproverOracle: zero registry");
+        owner            = msg.sender;
+        identityRegistry = IIdentityRegistry(identityRegistry_);
     }
 
     // -------------------------------------------------------------------------
-    // Oracle management
-    // -------------------------------------------------------------------------
-
-    function addOracle(address oracle) external onlyOwner {
-        isOracle[oracle] = true;
-        emit OracleAdded(oracle);
-    }
-
-    function removeOracle(address oracle) external onlyOwner {
-        isOracle[oracle] = false;
-        emit OracleRemoved(oracle);
-    }
-
-    // -------------------------------------------------------------------------
-    // MCP Tool: approve_pr  — request side
+    // MCP Tool: approve_pr — request side
     // -------------------------------------------------------------------------
 
     /**
      * @notice Request an approval decision for a pull request.
      * @param prId          Pull request identifier.
-     * @param reviewerAgent Endpoint of the reviewer agent whose comments should be considered.
-     *                      Pass an empty string to let the oracle decide.
-     * @param message       Optional message from the requester to the approver.
+     * @param reviewerAgent Endpoint hint for the approver oracle (e.g. "http://localhost:8001").
+     * @param message       Optional message from the requester.
      * @return requestId    Unique identifier for this request.
      */
     function requestApproval(
@@ -183,88 +163,91 @@ contract CodeApproverOracle {
     }
 
     // -------------------------------------------------------------------------
-    // MCP Tool: approve_pr  — fulfillment side (oracle callback)
+    // MCP Tool: approve_pr — fulfillment callbacks (oracle)
     // -------------------------------------------------------------------------
 
     /**
      * @notice Called by the oracle when the PR is approved with no blocking issues.
+     * @param agentId    ERC-8004 agentId of the calling oracle.
      * @param requestId  The requestId from the original ApprovalRequested event.
-     * @param prId       Pull request identifier (must match the request).
-     * @param reasonJson Raw JSON bytes for the approval reason/message.
+     * @param prId       Pull request identifier.
+     * @param reasonJson Raw JSON bytes for the approval reason.
      */
     function fulfillApproval(
+        uint256         agentId,
         bytes32         requestId,
         string calldata prId,
         bytes  calldata reasonJson
     )
         external
-        onlyOracle
+        onlyRegisteredOracle(agentId)
     {
         ApprovalRequest storage req = _requirePending(requestId, prId);
         req.status = RequestStatus.Approved;
 
         bytes memory decisionBytes = bytes('"approved"');
-        _storeResult(requestId, prId, decisionBytes, reasonJson, bytes("[]"));
-
+        _storeResult(requestId, prId, decisionBytes, reasonJson, bytes("[]"), agentId);
         approvalDecisions[prId] = decisionBytes;
 
-        emit PRApproved(requestId, prId, msg.sender, block.timestamp);
+        emit PRApproved(requestId, prId, agentId, block.timestamp);
     }
 
     /**
-     * @notice Called by the oracle when the PR needs revision (blocking issues remain).
-     * @param requestId          The requestId from the original ApprovalRequested event.
-     * @param prId               Pull request identifier.
-     * @param reasonJson         Raw JSON bytes for the reason.
-     * @param unresolvedJson     Raw JSON array of unresolved blocker descriptions.
+     * @notice Called by the oracle when the PR needs revision.
+     * @param agentId        ERC-8004 agentId of the calling oracle.
+     * @param requestId      The requestId from the original ApprovalRequested event.
+     * @param prId           Pull request identifier.
+     * @param reasonJson     Raw JSON bytes for the reason.
+     * @param unresolvedJson Raw JSON array of unresolved blocker descriptions.
      */
     function fulfillNeedsRevision(
+        uint256         agentId,
         bytes32         requestId,
         string calldata prId,
         bytes  calldata reasonJson,
         bytes  calldata unresolvedJson
     )
         external
-        onlyOracle
+        onlyRegisteredOracle(agentId)
     {
         ApprovalRequest storage req = _requirePending(requestId, prId);
         req.status = RequestStatus.NeedsRevision;
 
         bytes memory decisionBytes = bytes('"needs_revision"');
-        _storeResult(requestId, prId, decisionBytes, reasonJson, unresolvedJson);
-
+        _storeResult(requestId, prId, decisionBytes, reasonJson, unresolvedJson, agentId);
         approvalDecisions[prId] = decisionBytes;
 
-        emit RevisionRequested(requestId, prId, unresolvedJson, msg.sender, block.timestamp);
+        emit RevisionRequested(requestId, prId, unresolvedJson, agentId, block.timestamp);
     }
 
     // -------------------------------------------------------------------------
-    // MCP Tool: reject_pr  — fulfillment side (oracle callback)
+    // MCP Tool: reject_pr — fulfillment callback
     // -------------------------------------------------------------------------
 
     /**
      * @notice Called by the oracle when the PR is fundamentally rejected.
+     * @param agentId    ERC-8004 agentId of the calling oracle.
      * @param requestId  The requestId from the original ApprovalRequested event.
      * @param prId       Pull request identifier.
      * @param reasonJson Raw JSON bytes explaining the rejection.
      */
     function fulfillRejection(
+        uint256         agentId,
         bytes32         requestId,
         string calldata prId,
         bytes  calldata reasonJson
     )
         external
-        onlyOracle
+        onlyRegisteredOracle(agentId)
     {
         ApprovalRequest storage req = _requirePending(requestId, prId);
         req.status = RequestStatus.Rejected;
 
         bytes memory decisionBytes = bytes('"rejected"');
-        _storeResult(requestId, prId, decisionBytes, reasonJson, bytes("[]"));
-
+        _storeResult(requestId, prId, decisionBytes, reasonJson, bytes("[]"), agentId);
         approvalDecisions[prId] = decisionBytes;
 
-        emit PRRejected(requestId, prId, reasonJson, msg.sender, block.timestamp);
+        emit PRRejected(requestId, prId, reasonJson, agentId, block.timestamp);
     }
 
     // -------------------------------------------------------------------------
@@ -287,12 +270,13 @@ contract CodeApproverOracle {
     /**
      * @notice Returns the full result for a specific request.
      * @param requestId The request to query.
-     * @return status            Current RequestStatus.
-     * @return prId              Pull request identifier.
-     * @return decision          Raw JSON decision bytes.
-     * @return reason            Raw JSON reason bytes.
+     * @return status             Current RequestStatus.
+     * @return prId               Pull request identifier.
+     * @return decision           Raw JSON decision bytes.
+     * @return reason             Raw JSON reason bytes.
      * @return unresolvedBlockers Raw JSON array of unresolved blockers.
-     * @return fulfilledAt       Timestamp of fulfillment (0 if not yet fulfilled).
+     * @return agentId            ERC-8004 agentId of the fulfilling oracle.
+     * @return fulfilledAt        Timestamp of fulfillment (0 if not yet fulfilled).
      */
     function getResult(bytes32 requestId)
         external
@@ -303,21 +287,14 @@ contract CodeApproverOracle {
             bytes   memory decision,
             bytes   memory reason,
             bytes   memory unresolvedBlockers,
+            uint256        agentId,
             uint256        fulfilledAt
         )
     {
         ApprovalRequest storage req = requests[requestId];
         require(req.createdAt != 0, "CodeApproverOracle: unknown requestId");
-
         ApprovalResult storage res = results[requestId];
-        return (
-            req.status,
-            req.prId,
-            res.decision,
-            res.reason,
-            res.unresolvedBlockers,
-            res.fulfilledAt
-        );
+        return (req.status, req.prId, res.decision, res.reason, res.unresolvedBlockers, res.agentId, res.fulfilledAt);
     }
 
     // -------------------------------------------------------------------------
@@ -329,10 +306,9 @@ contract CodeApproverOracle {
      */
     function cancelApproval(bytes32 requestId) external {
         ApprovalRequest storage req = requests[requestId];
-        require(req.createdAt != 0,                   "CodeApproverOracle: unknown requestId");
-        require(req.requester == msg.sender,           "CodeApproverOracle: not requester");
-        require(req.status == RequestStatus.Pending,  "CodeApproverOracle: not pending");
-
+        require(req.createdAt != 0,                  "CodeApproverOracle: unknown requestId");
+        require(req.requester == msg.sender,          "CodeApproverOracle: not requester");
+        require(req.status == RequestStatus.Pending, "CodeApproverOracle: not pending");
         req.status = RequestStatus.Cancelled;
         emit ApprovalCancelled(requestId, req.prId);
     }
@@ -347,8 +323,8 @@ contract CodeApproverOracle {
         returns (ApprovalRequest storage req)
     {
         req = requests[requestId];
-        require(req.createdAt != 0,                     "CodeApproverOracle: unknown requestId");
-        require(req.status == RequestStatus.Pending,    "CodeApproverOracle: request not pending");
+        require(req.createdAt != 0,                  "CodeApproverOracle: unknown requestId");
+        require(req.status == RequestStatus.Pending, "CodeApproverOracle: request not pending");
         require(
             keccak256(bytes(req.prId)) == keccak256(bytes(prId)),
             "CodeApproverOracle: prId mismatch"
@@ -360,16 +336,16 @@ contract CodeApproverOracle {
         string calldata prId,
         bytes memory decision,
         bytes calldata reason,
-        bytes memory unresolvedBlockers
+        bytes memory unresolvedBlockers,
+        uint256 agentId
     ) internal {
         results[requestId] = ApprovalResult({
-            prId:              prId,
-            decision:          decision,
-            reason:            reason,
+            prId:               prId,
+            decision:           decision,
+            reason:             reason,
             unresolvedBlockers: unresolvedBlockers,
-            oracle:            msg.sender,
-            fulfilledAt:       block.timestamp
+            agentId:            agentId,
+            fulfilledAt:        block.timestamp
         });
     }
 }
-

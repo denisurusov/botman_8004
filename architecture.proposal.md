@@ -119,9 +119,10 @@ Governs Dave and Eve.
 
 - **Request/response pattern** — every tool call is a two-step on-chain lifecycle: request (emits event) → fulfillment (oracle callback)
 - **Raw bytes storage** — all payloads (`summary`, `comments`, `reason`, `unresolved_blockers`) are stored as raw `bytes` (serialised JSON). This keeps gas low, keeps the contract schema-agnostic, and delegates serialisation to the off-chain layer.
-- **Authorised oracle set** — only addresses registered via `addOracle()` may call `fulfill*()`. The owner manages this set.
+- **Identity-registry authorization** — oracle contracts do not maintain their own whitelist. Authorization is fully delegated to `IdentityRegistryUpgradeable` via the `onlyRegisteredOracle(agentId)` modifier (see section 11 for full rationale).
 - **Unique request IDs** — `requestId = keccak256(requester, prId, timestamp, nonce)` — collision-resistant, deterministic, no external randomness needed.
 - **MCP resource mirroring** — every MCP resource URI maps to a `mapping` on-chain, updated on each fulfillment, readable by any caller.
+- **Result attribution** — every fulfilled result stores the `agentId` of the oracle that produced it, creating a permanent on-chain link to the registered agent identity.
 
 ### 5.1 `CodeReviewerOracle.sol`
 
@@ -360,16 +361,149 @@ Each bridge event handler is independently idempotent — it reads the event, ca
 
 ---
 
-## 11. Next Steps
+## 11. ERC-8004 Extension: Oracle Binding
+
+### Context — the enterprise angle
+
+This system is designed as an **enterprise agentic workflow framework**. In enterprise environments:
+
+- Agent deployments are **strictly controlled** — every agent must be identifiable, auditable, and traceable to a responsible owner
+- The set of active agents is **small and known** — scalability of the identity scheme is a secondary concern compared to correctness and auditability
+- Compliance and security teams need a **single authoritative source** to answer "what contract does this agent control, who registered it, and when?"
+- Agent NFTs may be subject to **transfer controls** — the oracle binding must not persist to a new owner any more than a verified wallet would
+
+This context drove the decision to extend ERC-8004 rather than layer on top of it.
+
+### The problem
+
+The initial oracle contracts used a raw `isOracle[address]` whitelist to authorise `fulfill*()` calls. This creates two independent registries:
+
+```
+IdentityRegistry   — knows who the agent is
+Oracle whitelist   — knows which address can write results
+```
+
+They can drift out of sync. An agent can be revoked from the identity registry but remain in the oracle whitelist. There is no audit trail linking a fulfilled result to a specific registered agent identity.
+
+### Option B — Store oracle address as generic metadata (rejected)
+
+Oracle address stored as an arbitrary metadata entry alongside `capability`, `description`, etc.:
+
+```solidity
+register(agentURI, [
+    MetadataEntry("capability",    bytes("code-review")),
+    MetadataEntry("oracleAddress", abi.encodePacked(oracleAddr))
+])
+```
+
+**Pros:**
+- Zero changes to the ERC-8004 standard
+- Already works with existing `setMetadata` / `getMetadata` functions
+
+**Cons:**
+- `oracleAddress` is opaque `bytes` — no type safety, no dedicated getter, no dedicated event
+- Nothing prevents it being overwritten by any approved operator via `setMetadata`
+- Two separate lookups required to resolve an oracle: `getMetadata(agentId, "oracleAddress")` + manual `abi.decode`
+- No semantic distinction between oracle binding and arbitrary metadata — auditors see it as just another key
+- Oracle binding does **not** clear on transfer without explicit code to handle the `"oracleAddress"` key specially — a latent security gap
+
+### Option A — First-class reserved field (chosen)
+
+`oracleAddress` is promoted to a **reserved typed field** following the exact same pattern as `agentWallet`:
+
+```solidity
+bytes32 private constant RESERVED_ORACLE_ADDRESS_KEY_HASH = keccak256("oracleAddress");
+
+function getOracleAddress(uint256 agentId) external view returns (address)
+function setOracleAddress(uint256 agentId, address oracleAddress) external   // owner/approved only
+event OracleAddressSet(uint256 indexed agentId, address indexed oracleAddress, address indexed setBy)
+```
+
+**Why Option A wins for enterprise:**
+
+| Concern | Option B | Option A |
+|---|---|---|
+| Type safety | `bytes` blob | `address` — compiler-enforced |
+| Dedicated event | No | `OracleAddressSet` — queryable audit log |
+| Protection from accidental overwrite | No (`setMetadata` accepts any key) | Yes — `_requireNotReserved` blocks it |
+| Cleared on transfer | Only if code specifically handles the key | Yes — `_update` clears it unconditionally |
+| Single source of truth | No — needs convention + decoding | Yes — `getOracleAddress(agentId)` |
+| Audit trail | Buried in generic `MetadataSet` events | Dedicated `OracleAddressSet` events |
+| One-shot registration | Not naturally | `register(agentURI, metadata[], oracleAddress)` |
+
+**Storage impact:** zero. `oracleAddress` lives in the existing `_metadata` mapping under the `"oracleAddress"` key. No new storage slots are introduced. The UUPS upgrade path is unaffected.
+
+### The one-shot registration path
+
+The canonical enterprise registration is now a single transaction:
+
+```solidity
+uint256 agentId = identityRegistry.register(
+    "ipfs://Qm.../alice.json",               // agent card URI
+    [MetadataEntry("capability", "code-review")],
+    address(codeReviewerOracle)              // oracle binding
+);
+```
+
+This establishes in one atomic operation:
+- Agent identity (ERC-721 token)
+- Agent card URI (ERC-721 tokenURI)
+- Capability metadata
+- Verified `agentWallet` (set to `msg.sender`)
+- Oracle contract binding (`oracleAddress`)
+
+All five facts are co-located in a single transaction hash, a single `Registered` event, and a single `OracleAddressSet` event.
+
+### How oracle authorization now works
+
+Oracle contracts no longer maintain their own whitelist. Authorization is fully delegated to the identity registry:
+
+```solidity
+modifier onlyRegisteredOracle(uint256 agentId) {
+    require(
+        identityRegistry.getAgentWallet(agentId) == msg.sender,
+        "caller is not the registered agentWallet"
+    );
+    require(
+        identityRegistry.getOracleAddress(agentId) == address(this),
+        "agentId not bound to this oracle"
+    );
+    _;
+}
+```
+
+Two checks, both resolved from the single identity registry:
+1. `msg.sender` is the verified wallet for the agent
+2. The agent's registered oracle is this contract
+
+The `agentId` is passed as a parameter by the bridge on every `fulfill*()` call, and is stored in the result — creating a permanent on-chain link from every fulfilled result to the registered agent identity that produced it.
+
+### Transfer behaviour
+
+On ERC-721 transfer, `_update` clears **both** `agentWallet` and `oracleAddress`:
+
+```solidity
+if (from != address(0) && to != address(0)) {
+    $._metadata[tokenId]["agentWallet"]   = "";
+    $._metadata[tokenId]["oracleAddress"] = "";
+    emit OracleAddressSet(tokenId, address(0), msg.sender);
+}
+```
+
+The new owner must re-bind their own wallet and oracle. This prevents a transferred agent identity from inheriting access to the previous owner's oracle contracts — a critical enterprise security property.
+
+---
+
+## 12. Next Steps
 
 | Priority | Item |
 |---|---|
 | High | Replace stub `review_pr` / `approve_pr` handlers with real LLM calls |
-| High | Deploy `CodeReviewerOracle` and `CodeApproverOracle` and register bridge wallets as oracles via `addOracle()` |
-| High | Update `deploy-registries.js` (or add `deploy-oracles.js`) to deploy the new contracts and write addresses to a config file read by `launch-bridges.js` |
+| High | Update `deploy-registries.js` to deploy `CodeReviewerOracle` and `CodeApproverOracle` with the identity registry address, then call `register(agentURI, metadata[], oracleAddress)` for each agent card |
+| High | Update bridges to pass `agentId` on every `fulfill*()` call |
 | Medium | Add a `deployed-addresses.json` file so bridges can auto-read contract addresses without CLI flags |
-| Medium | Extract `MCPOracle.sol` base contract (requestId generation, oracle auth, pending state) shared by both oracle contracts |
+| Medium | Extract `MCPOracle.sol` base contract (requestId generation, `onlyRegisteredOracle` modifier) shared by both oracle contracts |
 | Medium | Add `resources/subscribe` support to MCP servers for real-time resource updates |
-| Low | Replace in-memory `reviewStore` / `decisionStore` with a persistent DB or read directly from on-chain state |
+| Low | Replace in-memory `reviewStore` / `decisionStore` in MCP servers with persistent DB or direct on-chain reads |
 | Low | Add round-robin / load-balancing across multiple reviewer instances (Alice + Bob) in the bridge |
 
