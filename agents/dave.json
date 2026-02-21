@@ -1,7 +1,8 @@
 {
-  "name": "CodeReviewerDave",
-  "description": "Reviews Solidity code for bugs",
-  "capabilities": ["code-review", "solidity"],
+  "name": "CodeApproverDave",
+  "description": "Approves pull requests after code review",
+  "capabilities": ["approve-pr"],
   "endpoint": "http://localhost:8003",
-  "image": "https://example.com/alice.png"
+  "image": "https://example.com/dave.png",
+  "mcpSpec": "./mcp/code-approver.mcp.json"
 }

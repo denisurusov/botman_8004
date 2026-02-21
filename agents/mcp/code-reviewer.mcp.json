@@ -1,0 +1,119 @@
+{
+  "$schema": "https://modelcontextprotocol.io/schema/v1/server.json",
+  "name": "code-reviewer",
+  "version": "1.0.0",
+  "description": "MCP specification for code review agents. Accepts a PR ID and returns structured review comments.",
+
+  "tools": [
+    {
+      "name": "review_pr",
+      "description": "Performs a code review on the specified pull request and returns structured comments.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pr_id": {
+            "type": "string",
+            "description": "The pull request identifier (e.g. '42' or 'org/repo#42')"
+          },
+          "focus": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["bugs", "security", "style", "performance", "tests", "documentation"]
+            },
+            "description": "Optional list of aspects to focus the review on. Defaults to all."
+          }
+        },
+        "required": ["pr_id"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "pr_id": { "type": "string" },
+          "summary": { "type": "string", "description": "High-level review summary" },
+          "comments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "file": { "type": "string" },
+                "line": { "type": "integer" },
+                "severity": {
+                  "type": "string",
+                  "enum": ["info", "warning", "error", "critical"]
+                },
+                "category": {
+                  "type": "string",
+                  "enum": ["bugs", "security", "style", "performance", "tests", "documentation"]
+                },
+                "message": { "type": "string" },
+                "suggestion": { "type": "string" }
+              },
+              "required": ["file", "line", "severity", "category", "message"]
+            }
+          },
+          "approved": {
+            "type": "boolean",
+            "description": "Whether the reviewer recommends approval"
+          }
+        },
+        "required": ["pr_id", "summary", "comments", "approved"]
+      }
+    },
+    {
+      "name": "get_review_status",
+      "description": "Returns the current review status and existing comments for a PR.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pr_id": {
+            "type": "string",
+            "description": "The pull request identifier"
+          }
+        },
+        "required": ["pr_id"]
+      }
+    }
+  ],
+
+  "resources": [
+    {
+      "uri": "review://{pr_id}/comments",
+      "name": "PR Review Comments",
+      "description": "All review comments posted on a given pull request.",
+      "mimeType": "application/json"
+    },
+    {
+      "uri": "review://{pr_id}/diff",
+      "name": "PR Diff",
+      "description": "The raw unified diff of the pull request for context.",
+      "mimeType": "text/plain"
+    }
+  ],
+
+  "prompts": [
+    {
+      "name": "code_review",
+      "description": "Standard code review prompt. Instructs the agent to analyse the PR diff and produce structured, actionable feedback.",
+      "arguments": [
+        {
+          "name": "pr_id",
+          "description": "The pull request identifier",
+          "required": true
+        },
+        {
+          "name": "language",
+          "description": "Primary programming language of the PR (e.g. 'Solidity', 'TypeScript')",
+          "required": false
+        },
+        {
+          "name": "focus",
+          "description": "Comma-separated list of review aspects: bugs, security, style, performance, tests, documentation",
+          "required": false
+        }
+      ],
+      "template": "You are a senior {{#if language}}{{language}} {{/if}}code reviewer.\n\nReview pull request {{pr_id}}.\n\n{{#if focus}}Focus specifically on: {{focus}}.{{else}}Cover all aspects: bugs, security, style, performance, tests and documentation.{{/if}}\n\nFor every issue found, provide:\n- The file name and line number\n- Severity: info | warning | error | critical\n- Category: bugs | security | style | performance | tests | documentation\n- A clear message explaining the problem\n- A concrete suggestion for how to fix it\n\nFinish with a one-paragraph summary and a recommendation: APPROVE or REQUEST_CHANGES."
+    }
+  ]
+}
+

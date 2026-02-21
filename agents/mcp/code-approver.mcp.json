@@ -1,0 +1,96 @@
+{
+  "$schema": "https://modelcontextprotocol.io/schema/v1/server.json",
+  "name": "code-approver",
+  "version": "1.0.0",
+  "description": "MCP specification for code approver agents. Reads review comments from reviewer agents and issues a final approve or reject decision.",
+
+  "tools": [
+    {
+      "name": "approve_pr",
+      "description": "Approves a pull request after verifying that all blocking review comments have been resolved.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pr_id": {
+            "type": "string",
+            "description": "The pull request identifier"
+          },
+          "reviewer_agent": {
+            "type": "string",
+            "description": "Endpoint of the reviewer agent whose comments to consider (e.g. 'http://localhost:8001')"
+          },
+          "message": {
+            "type": "string",
+            "description": "Optional approval message left on the PR"
+          }
+        },
+        "required": ["pr_id"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "pr_id": { "type": "string" },
+          "decision": {
+            "type": "string",
+            "enum": ["approved", "rejected", "needs_revision"]
+          },
+          "reason": { "type": "string" },
+          "unresolved_blockers": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "List of unresolved critical/error comments that blocked approval"
+          }
+        },
+        "required": ["pr_id", "decision", "reason"]
+      }
+    },
+    {
+      "name": "reject_pr",
+      "description": "Rejects a pull request and returns reasons for rejection.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pr_id": { "type": "string" },
+          "reason": { "type": "string", "description": "Explanation of why the PR is rejected" }
+        },
+        "required": ["pr_id", "reason"]
+      }
+    }
+  ],
+
+  "resources": [
+    {
+      "uri": "review://{pr_id}/comments",
+      "name": "PR Review Comments",
+      "description": "Review comments produced by reviewer agents, used as input for the approval decision.",
+      "mimeType": "application/json"
+    },
+    {
+      "uri": "approval://{pr_id}/decision",
+      "name": "Approval Decision",
+      "description": "The stored approval or rejection decision for a pull request.",
+      "mimeType": "application/json"
+    }
+  ],
+
+  "prompts": [
+    {
+      "name": "approve_pr_prompt",
+      "description": "Standard approval prompt. Instructs the agent to read all review comments for a PR, check that blockers are resolved, and issue a final decision.",
+      "arguments": [
+        {
+          "name": "pr_id",
+          "description": "The pull request identifier",
+          "required": true
+        },
+        {
+          "name": "reviewer_summary",
+          "description": "Summary text produced by the reviewer agent",
+          "required": false
+        }
+      ],
+      "template": "You are a senior code approver responsible for the final gate before merge.\n\nPull request: {{pr_id}}\n\n{{#if reviewer_summary}}Reviewer summary:\n{{reviewer_summary}}\n\n{{/if}}Steps:\n1. Retrieve all review comments for PR {{pr_id}} using the review://{pr_id}/comments resource.\n2. Identify any comments with severity 'critical' or 'error' that are still unresolved.\n3. If NO blocking issues remain: call approve_pr with decision 'approved' and a brief approval message.\n4. If blocking issues exist: call approve_pr with decision 'needs_revision', listing each blocker in unresolved_blockers.\n5. If the PR is fundamentally flawed and cannot be salvaged: call reject_pr with a clear reason.\n\nBe concise, factual and constructive."
+    }
+  ]
+}
+

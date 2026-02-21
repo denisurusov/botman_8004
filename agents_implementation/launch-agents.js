@@ -19,8 +19,19 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ── Config ───────────────────────────────────────────────────────────────────
-const AGENTS_DIR = path.resolve(__dirname, '..', 'agents');
-const SERVER_JS  = path.resolve(__dirname, 'server.js');
+const AGENTS_DIR          = path.resolve(__dirname, '..', 'agents');
+const REVIEWER_SERVER_JS  = path.resolve(__dirname, 'code-reviewer-server.js');
+const APPROVER_SERVER_JS  = path.resolve(__dirname, 'code-approver-server.js');
+// Legacy fallback for cards with no recognised capability
+const FALLBACK_SERVER_JS  = path.resolve(__dirname, 'code-reviewer-server.js');
+
+/** Pick the right server script for a given agent card. */
+function serverScriptFor(card) {
+  const caps = card.capabilities ?? [];
+  if (caps.includes('approve-pr')) return APPROVER_SERVER_JS;
+  if (caps.includes('code-review'))  return REVIEWER_SERVER_JS;
+  return FALLBACK_SERVER_JS;
+}
 
 let BASE_PORT = 9000;
 const bpIdx = process.argv.indexOf('--base-port');
@@ -75,9 +86,10 @@ cardFiles.forEach((file) => {
   usedPorts.add(port);
   if (port === fallbackPort) fallbackPort++;
 
+  const serverScript = serverScriptFor(card);
   const child = spawn(
     process.execPath,
-    [SERVER_JS, cardPath, String(port)],
+    [serverScript, cardPath, String(port)],
     { stdio: 'inherit', detached: false }
   );
 
@@ -91,7 +103,7 @@ cardFiles.forEach((file) => {
     }
   });
 
-  console.log(`Spawned [${file}] → http://localhost:${port}  (pid ${child.pid})`);
+  console.log(`Spawned [${file}] → http://localhost:${port}  (pid ${child.pid})  [${path.basename(serverScript)}]`);
   children.push(child);
 });
 

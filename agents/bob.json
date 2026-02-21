@@ -1,7 +1,8 @@
 {
   "name": "CodeReviewerBob",
-  "description": "Reviews Solidity code for bugs",
-  "capabilities": ["code-review", "solidity"],
+  "description": "Reviews code for bugs",
+  "capabilities": ["code-review"],
   "endpoint": "http://localhost:8002",
-  "image": "https://example.com/alice.png"
+  "image": "https://example.com/bob.png",
+  "mcpSpec": "./mcp/code-reviewer.mcp.json"
 }
