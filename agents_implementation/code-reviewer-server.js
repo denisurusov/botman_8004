@@ -137,8 +137,10 @@ const TOOLS = {
       required: ['pr_id'],
     },
     handler: (params) => {
-      const { pr_id, focus } = params;
+      const { pr_id, focus, trace_id } = params;
       if (!pr_id) throw new Error('pr_id is required');
+      const traceId = trace_id || 'unknown';
+      console.log(`[${agentName}] [${traceId}] review_pr pr_id=${pr_id} focus=${JSON.stringify(focus ?? 'all')}`);
 
       // ── Stub implementation ──────────────────────────────────────────────
       // Replace this block with a real LLM call or external API.
@@ -175,8 +177,9 @@ const TOOLS = {
       required: ['pr_id'],
     },
     handler: (params) => {
-      const { pr_id } = params;
+      const { pr_id, trace_id } = params;
       if (!pr_id) throw new Error('pr_id is required');
+      console.log(`[${agentName}] [${trace_id || 'unknown'}] get_review_status pr_id=${pr_id}`);
       const data = reviewStore.get(pr_id);
       if (!data) return { pr_id, status: 'not_found', comments: [] };
       return { pr_id, status: 'completed', ...data };

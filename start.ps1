@@ -120,20 +120,30 @@ if ($LASTEXITCODE -ne 0) {
     Stop-All; exit 1
 }
 
-# Parse "IdentityRegistry → 0x..." from output
-$identityMatch = ($deployOutput | Select-String "IdentityRegistry\s*[->]\s*(0x[0-9a-fA-F]+)")
+# Parse contract addresses from output
+$identityMatch = ($deployOutput | Select-String "IdentityRegistry\s*[→->]+\s*(0x[0-9a-fA-F]+)")
+$reviewerMatch = ($deployOutput | Select-String "CodeReviewerOracle\s*[→->]+\s*(0x[0-9a-fA-F]+)")
+$approverMatch = ($deployOutput | Select-String "CodeApproverOracle\s*[→->]+\s*(0x[0-9a-fA-F]+)")
+$traceLogMatch = ($deployOutput | Select-String "ExecutionTraceLog\s*[→->]+\s*(0x[0-9a-fA-F]+)")
+
 if (-not $identityMatch) {
-    # Also try the unicode arrow that the script may emit
+    # Fallback: grab first hex address
     $identityMatch = ($deployOutput | Select-String "(0x[0-9a-fA-F]{40})")
 }
-$identityAddr = if ($identityMatch) { $identityMatch.Matches[0].Groups[1].Value } else { $null }
+$identityAddr     = if ($identityMatch) { $identityMatch.Matches[0].Groups[1].Value } else { $null }
+$reviewerOracleAddr = if ($reviewerMatch) { $reviewerMatch.Matches[0].Groups[1].Value } else { $null }
+$approverOracleAddr = if ($approverMatch) { $approverMatch.Matches[0].Groups[1].Value } else { $null }
+$traceLogAddr       = if ($traceLogMatch) { $traceLogMatch.Matches[0].Groups[1].Value } else { $null }
 
 if (-not $identityAddr) {
     Write-Error "Could not parse IdentityRegistry address from deploy output."
     Stop-All; exit 1
 }
 
-Write-Host "`n  IdentityRegistry address: $identityAddr" -ForegroundColor Green
+Write-Host "`n  IdentityRegistry:   $identityAddr" -ForegroundColor Green
+Write-Host "  CodeReviewerOracle: $reviewerOracleAddr" -ForegroundColor Green
+Write-Host "  CodeApproverOracle: $approverOracleAddr" -ForegroundColor Green
+Write-Host "  ExecutionTraceLog:  $traceLogAddr" -ForegroundColor Green
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 4 – Register agent cards on-chain
@@ -153,16 +163,58 @@ Pop-Location
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 5 – Launch MCP servers (foreground – Ctrl-C stops everything)
 # ─────────────────────────────────────────────────────────────────────────────
-Write-Step "5/5  Launching MCP agent servers"
+Write-Step "5/5  Launching MCP agent servers & oracle bridges"
 
 $launchArgs = @("agents_implementation/launch-agents.js")
 if ($BasePort -gt 0) { $launchArgs += "--base-port"; $launchArgs += "$BasePort" }
+
+# Start oracle bridges if contract addresses are available
+$bridgeProcs = @()
+# Hardhat account #0 private key (default for local dev)
+$oraclePrivKey = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+
+if ($reviewerOracleAddr) {
+    Write-Host "  Launching code-reviewer-bridge → $reviewerOracleAddr" -ForegroundColor DarkCyan
+    $bridgeProcs += Start-Process -FilePath 'node' `
+        -ArgumentList @(
+            'agents_implementation/code-reviewer-bridge.js',
+            '--contract', $reviewerOracleAddr,
+            '--rpc', 'http://127.0.0.1:8545',
+            '--privkey', $oraclePrivKey
+        ) `
+        -WorkingDirectory $Root `
+        -RedirectStandardOutput (Join-Path $AgentsImpl 'logs/code-reviewer-bridge.log') `
+        -RedirectStandardError  (Join-Path $AgentsImpl 'logs/code-reviewer-bridge.err.log') `
+        -NoNewWindow -PassThru
+}
+
+if ($approverOracleAddr) {
+    Write-Host "  Launching code-approver-bridge → $approverOracleAddr" -ForegroundColor DarkCyan
+    $bridgeProcs += Start-Process -FilePath 'node' `
+        -ArgumentList @(
+            'agents_implementation/code-approver-bridge.js',
+            '--contract', $approverOracleAddr,
+            '--rpc', 'http://127.0.0.1:8545',
+            '--privkey', $oraclePrivKey
+        ) `
+        -WorkingDirectory $Root `
+        -RedirectStandardOutput (Join-Path $AgentsImpl 'logs/code-approver-bridge.log') `
+        -RedirectStandardError  (Join-Path $AgentsImpl 'logs/code-approver-bridge.err.log') `
+        -NoNewWindow -PassThru
+}
 
 try {
     Push-Location $Root
     node @launchArgs
 } finally {
     Pop-Location
+    # Stop bridges
+    foreach ($bp in $bridgeProcs) {
+        if ($bp -and -not $bp.HasExited) {
+            Stop-Process -Id $bp.Id -Force -ErrorAction SilentlyContinue
+            Write-Host "  Stopped bridge (pid $($bp.Id))"
+        }
+    }
     Stop-All
 }
 

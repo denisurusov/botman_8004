@@ -9,16 +9,14 @@
  *   fulfillNeedsRevision() — decision === 'needs_revision'
  *   fulfillRejection()     — decision === 'rejected'
  *
+ * Distributed tracing: reads traceId from the event and propagates it
+ * to the MCP server via X-Trace-Id header and tool argument.
+ *
  * Usage:
  *   node code-approver-bridge.js \
  *     --contract  0xYourCodeApproverOracleAddress \
  *     --rpc       http://127.0.0.1:8545 \
  *     --privkey   0xYourOraclePrivateKey
- *
- * Env vars (alternative to CLI flags):
- *   APPROVER_CONTRACT_ADDRESS
- *   RPC_URL
- *   ORACLE_PRIVATE_KEY
  */
 
 import { ethers } from 'ethers';
@@ -61,16 +59,16 @@ function pickApproverEndpoint() {
 
 // ── Minimal ABI ───────────────────────────────────────────────────────────────
 const ABI = [
-  // Events
-  'event ApprovalRequested(bytes32 indexed requestId, address indexed requester, string prId, string reviewerAgent, uint256 timestamp)',
-  // Fulfillment callbacks
-  'function fulfillApproval(bytes32 requestId, string prId, bytes reasonJson)',
-  'function fulfillNeedsRevision(bytes32 requestId, string prId, bytes reasonJson, bytes unresolvedJson)',
-  'function fulfillRejection(bytes32 requestId, string prId, bytes reasonJson)',
+  // Events (with traceId)
+  'event ApprovalRequested(bytes32 indexed requestId, address indexed requester, string prId, bytes32 indexed traceId, string reviewerAgent, uint256 timestamp)',
+  // Fulfillment callbacks (no traceId param — contract reads it from storage)
+  'function fulfillApproval(uint256 agentId, bytes32 requestId, string prId, bytes reasonJson)',
+  'function fulfillNeedsRevision(uint256 agentId, bytes32 requestId, string prId, bytes reasonJson, bytes unresolvedJson)',
+  'function fulfillRejection(uint256 agentId, bytes32 requestId, string prId, bytes reasonJson)',
 ];
 
 // ── Call the MCP server's approve_pr tool ─────────────────────────────────────
-async function callApproveTool(endpoint, prId, reviewerAgent) {
+async function callApproveTool(endpoint, prId, reviewerAgent, traceId) {
   const body = {
     jsonrpc: '2.0', id: 1,
     method:  'tools/call',
@@ -79,14 +77,18 @@ async function callApproveTool(endpoint, prId, reviewerAgent) {
       arguments: {
         pr_id:          prId,
         reviewer_agent: reviewerAgent || undefined,
+        trace_id:       traceId,
       },
     },
   };
 
   const res  = await fetch(`${endpoint}/mcp`, {
     method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify(body),
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Trace-Id':   traceId,
+    },
+    body: JSON.stringify(body),
   });
   const json = await res.json();
 
@@ -108,34 +110,34 @@ async function main() {
   console.log(`[approver-bridge] Oracle   : ${wallet.address}`);
   console.log(`[approver-bridge] Listening for ApprovalRequested events…\n`);
 
-  contract.on('ApprovalRequested', async (requestId, requester, prId, reviewerAgent, timestamp) => {
-    console.log(`\n[approver-bridge] ← ApprovalRequested  requestId=${requestId}  prId="${prId}"  reviewerAgent="${reviewerAgent}"`);
+  contract.on('ApprovalRequested', async (requestId, requester, prId, traceId, reviewerAgent, timestamp) => {
+    console.log(`\n[approver-bridge] ← ApprovalRequested  requestId=${requestId}  prId="${prId}"  traceId=${traceId}`);
 
     const endpoint = pickApproverEndpoint();
     console.log(`[approver-bridge]   routing to MCP server: ${endpoint}`);
 
     try {
-      const result = await callApproveTool(endpoint, prId, reviewerAgent);
+      const result = await callApproveTool(endpoint, prId, reviewerAgent, traceId);
       const { decision, reason, unresolved_blockers } = result;
 
       const reasonBytes     = ethers.toUtf8Bytes(JSON.stringify(reason ?? ''));
       const unresolvedBytes = ethers.toUtf8Bytes(JSON.stringify(unresolved_blockers ?? []));
 
-      console.log(`[approver-bridge]   MCP decision: ${decision}`);
+      console.log(`[approver-bridge]   [${traceId}] MCP decision: ${decision}`);
 
+      // agentId = 0 for now (would be the registered ERC-8004 agentId in production)
       let tx;
       if (decision === 'approved') {
-        tx = await contract.fulfillApproval(requestId, prId, reasonBytes);
+        tx = await contract.fulfillApproval(0, requestId, prId, reasonBytes);
       } else if (decision === 'needs_revision') {
-        tx = await contract.fulfillNeedsRevision(requestId, prId, reasonBytes, unresolvedBytes);
+        tx = await contract.fulfillNeedsRevision(0, requestId, prId, reasonBytes, unresolvedBytes);
       } else {
-        // 'rejected' or anything unexpected
-        tx = await contract.fulfillRejection(requestId, prId, reasonBytes);
+        tx = await contract.fulfillRejection(0, requestId, prId, reasonBytes);
       }
 
-      console.log(`[approver-bridge]   → fulfill tx: ${tx.hash}`);
+      console.log(`[approver-bridge]   [${traceId}] → fulfill tx: ${tx.hash}`);
       await tx.wait();
-      console.log(`[approver-bridge]   ✓ fulfilled  requestId=${requestId}  decision=${decision}`);
+      console.log(`[approver-bridge]   [${traceId}] ✓ fulfilled  requestId=${requestId}  decision=${decision}`);
 
     } catch (err) {
       console.error(`[approver-bridge]   ✗ Error processing ${requestId}: ${err.message}`);

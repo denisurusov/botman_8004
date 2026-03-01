@@ -7,20 +7,14 @@
  * code-reviewer MCP server (tool: review_pr), then submits the
  * fulfillReview() transaction back to the contract.
  *
+ * Distributed tracing: reads traceId from the event and propagates it
+ * to the MCP server via X-Trace-Id header and tool argument.
+ *
  * Usage:
  *   node code-reviewer-bridge.js \
  *     --contract  0xYourCodeReviewerOracleAddress \
  *     --rpc       http://127.0.0.1:8545 \
  *     --privkey   0xYourOraclePrivateKey
- *
- * Env vars (alternative to CLI flags):
- *   REVIEWER_CONTRACT_ADDRESS
- *   RPC_URL
- *   ORACLE_PRIVATE_KEY
- *
- * Agent cards in ../agents are used to map a requester's requested
- * reviewerAgent hint to a live MCP endpoint.  Falls back to the first
- * reviewer agent found.
  */
 
 import { ethers } from 'ethers';
@@ -68,34 +62,40 @@ function pickReviewerEndpoint(hint) {
 
 // ── Minimal ABI — only what the bridge needs ──────────────────────────────────
 const ABI = [
-  // Events
-  'event ReviewRequested(bytes32 indexed requestId, address indexed requester, string prId, string focus, uint256 timestamp)',
-  // Fulfillment
-  'function fulfillReview(bytes32 requestId, string prId, bytes summaryJson, bytes commentsJson, bool approved)',
+  // Events (with traceId)
+  'event ReviewRequested(bytes32 indexed requestId, address indexed requester, string prId, bytes32 indexed traceId, string focus, uint256 timestamp)',
+  // Fulfillment (no traceId param — contract reads it from storage)
+  'function fulfillReview(uint256 agentId, bytes32 requestId, string prId, bytes summaryJson, bytes commentsJson, bool approved)',
 ];
 
 // ── Call the MCP server's review_pr tool ──────────────────────────────────────
-async function callReviewTool(endpoint, prId, focus) {
+async function callReviewTool(endpoint, prId, focus, traceId) {
   const focusArr = focus ? focus.split(',').map(s => s.trim()).filter(Boolean) : [];
   const body = {
     jsonrpc: '2.0', id: 1,
     method:  'tools/call',
     params: {
       name:      'review_pr',
-      arguments: { pr_id: prId, ...(focusArr.length ? { focus: focusArr } : {}) },
+      arguments: {
+        pr_id: prId,
+        trace_id: traceId,
+        ...(focusArr.length ? { focus: focusArr } : {}),
+      },
     },
   };
 
   const res  = await fetch(`${endpoint}/mcp`, {
     method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify(body),
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Trace-Id':   traceId,
+    },
+    body: JSON.stringify(body),
   });
   const json = await res.json();
 
   if (json.error) throw new Error(`MCP error: ${JSON.stringify(json.error)}`);
 
-  // MCP tools/call wraps result in content[0].text
   const raw = json?.result?.content?.[0]?.text;
   if (!raw) throw new Error('Empty MCP response');
   return JSON.parse(raw); // { pr_id, summary, comments, approved }
@@ -112,25 +112,26 @@ async function main() {
   console.log(`[reviewer-bridge] Oracle   : ${wallet.address}`);
   console.log(`[reviewer-bridge] Listening for ReviewRequested events…\n`);
 
-  contract.on('ReviewRequested', async (requestId, requester, prId, focus, timestamp) => {
-    console.log(`\n[reviewer-bridge] ← ReviewRequested  requestId=${requestId}  prId="${prId}"  focus="${focus}"`);
+  contract.on('ReviewRequested', async (requestId, requester, prId, traceId, focus, timestamp) => {
+    console.log(`\n[reviewer-bridge] ← ReviewRequested  requestId=${requestId}  prId="${prId}"  traceId=${traceId}`);
 
     const endpoint = pickReviewerEndpoint(null);
     console.log(`[reviewer-bridge]   routing to MCP server: ${endpoint}`);
 
     try {
-      const result = await callReviewTool(endpoint, prId, focus);
+      const result = await callReviewTool(endpoint, prId, focus, traceId);
 
       const summaryBytes   = ethers.toUtf8Bytes(JSON.stringify(result.summary   ?? ''));
       const commentsBytes  = ethers.toUtf8Bytes(JSON.stringify(result.comments  ?? []));
       const approved       = !!result.approved;
 
-      console.log(`[reviewer-bridge]   MCP result: approved=${approved}, comments=${result.comments?.length ?? 0}`);
+      console.log(`[reviewer-bridge]   [${traceId}] MCP result: approved=${approved}, comments=${result.comments?.length ?? 0}`);
 
-      const tx = await contract.fulfillReview(requestId, prId, summaryBytes, commentsBytes, approved);
-      console.log(`[reviewer-bridge]   → fulfillReview tx: ${tx.hash}`);
+      // agentId = 0 for now (would be the registered ERC-8004 agentId in production)
+      const tx = await contract.fulfillReview(0, requestId, prId, summaryBytes, commentsBytes, approved);
+      console.log(`[reviewer-bridge]   [${traceId}] → fulfillReview tx: ${tx.hash}`);
       await tx.wait();
-      console.log(`[reviewer-bridge]   ✓ fulfilled  requestId=${requestId}`);
+      console.log(`[reviewer-bridge]   [${traceId}] ✓ fulfilled  requestId=${requestId}`);
 
     } catch (err) {
       console.error(`[reviewer-bridge]   ✗ Error processing ${requestId}: ${err.message}`);
@@ -139,4 +140,3 @@ async function main() {
 }
 
 main().catch(err => { console.error(err); process.exit(1); });
-

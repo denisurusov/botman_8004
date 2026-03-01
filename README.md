@@ -7,7 +7,7 @@ Local development environment for an **enterprise agentic workflow framework** b
 
 The two standards are linked: every agent card points to an MCP spec, every MCP spec drives a Solidity oracle contract, and the identity registry binds the agent identity to that oracle in a single transaction.
 
-See [`architecture.proposal.md`](./architecture.proposal.md) for the full design rationale.
+See [`design/architecture.proposal.md`](./design/architecture.proposal.md) for the full design rationale.
 
 ---
 
@@ -70,13 +70,18 @@ botman_8004/
 │   ├── ReputationRegistry.sol           # Reputation scoring linked to agent identities
 │   ├── CodeReviewerOracle.sol           # On-chain oracle for code-review MCP tools
 │   ├── CodeApproverOracle.sol           # On-chain oracle for code-approver MCP tools
+│   ├── ExecutionTraceLog.sol            # Distributed tracing: records execution chain hops
 │   └── IIdentityRegistry.sol            # Interface consumed by oracle contracts
 │
 ├── scripts/
-│   ├── deploy-registries.js     # Deploys identity + reputation registries via proxy
+│   ├── deploy-registries.js     # Deploys identity, reputation, trace log, and oracle contracts
 │   └── register-mocks.js        # Registers agent cards on-chain
 │
-├── architecture.proposal.md     # Full design document
+├── design/
+│   ├── architecture.proposal.md   # Full design document
+│   ├── 8004.refactor.md           # ERC-8004 identity registry refactor notes
+│   └── distributed_tracing.md     # Execution chain tracing via correlation token
+│
 ├── hardhat.config.js
 ├── start.ps1
 └── package.json
@@ -285,6 +290,17 @@ This means **registration in the identity registry is the oracle authorization**
 - Payloads stored as raw JSON `bytes` — schema-agnostic, gas-efficient
 - MCP resources mirrored as on-chain mappings: `reviewComments[prId]`, `approvalDecisions[prId]`
 - Every fulfilled result stores the `agentId` of the oracle that produced it
+- **Distributed tracing**: every request and fulfillment carries a `bytes32 traceId` — a correlation token born at the start of an execution chain and propagated unchanged through every hop
+
+### `ExecutionTraceLog`
+
+- Central audit trail for execution chains — records ordered hops across all oracle contracts
+- Each hop captures: calling oracle address, agentId, action name, timestamp
+- Queryable via `getTrace(traceId)` — returns the full ordered execution chain
+- Oracle contracts call `_recordHop(traceId, agentId, "reviewRequested")` etc.
+- Can be set to `address(0)` to disable tracing with no gas overhead beyond the `if` check
+
+See [`design/distributed_tracing.md`](./design/distributed_tracing.md) for the full design.
 
 ### `ReputationRegistryUpgradeable`
 

@@ -3,12 +3,9 @@ require("@openzeppelin/hardhat-upgrades");
 
 module.exports = {
   solidity: {
-    version: "0.8.28",
+    version: "0.8.22",
     settings: {
-      optimizer: {
-        enabled: true,
-        runs: 200
-      },
+      optimizer: { enabled: true, runs: 1 },
       viaIR: true
     }
   },

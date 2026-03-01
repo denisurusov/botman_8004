@@ -2,8 +2,10 @@ const hre = require("hardhat");
 const fs = require("fs");
 const path = require("path");
 
-// Paste the IdentityRegistry proxy address from deploy-registries.js output
+// Contract addresses — set via env vars or edit constants
 const IDENTITY_REGISTRY_ADDRESS = process.env.IDENTITY_REGISTRY_ADDRESS || "0x...";
+const REVIEWER_CONTRACT_ADDRESS = process.env.REVIEWER_CONTRACT_ADDRESS || "";
+const APPROVER_CONTRACT_ADDRESS = process.env.APPROVER_CONTRACT_ADDRESS || "";
 
 async function main() {
     if (IDENTITY_REGISTRY_ADDRESS === "0x...") {
@@ -19,24 +21,45 @@ async function main() {
     const agentsDir = path.join(__dirname, "..", "agents");
     const agentFiles = fs.readdirSync(agentsDir).filter(f => f.endsWith(".json")).sort();
 
-    console.log(`Registering ${agentFiles.length} agents against ${IDENTITY_REGISTRY_ADDRESS}\n`);
+    console.log(`Registering ${agentFiles.length} agents against ${IDENTITY_REGISTRY_ADDRESS}`);
+    if (REVIEWER_CONTRACT_ADDRESS) console.log(`  Reviewer oracle: ${REVIEWER_CONTRACT_ADDRESS}`);
+    if (APPROVER_CONTRACT_ADDRESS) console.log(`  Approver oracle: ${APPROVER_CONTRACT_ADDRESS}`);
+    console.log();
 
     for (let i = 0; i < agentFiles.length; i++) {
         const file = agentFiles[i];
         const owner = signers[i + 1] ?? signers[0]; // signers[1..N], fall back to deployer
 
-        const json = fs.readFileSync(path.join(agentsDir, file), "utf8");
-        const uri = `data:application/json;base64,${Buffer.from(json).toString("base64")}`;
+        const card = JSON.parse(fs.readFileSync(path.join(agentsDir, file), "utf8"));
+        const uri = `data:application/json;base64,${Buffer.from(JSON.stringify(card)).toString("base64")}`;
 
-        const tx = await identity.connect(owner)["register(string)"](uri);
-        const receipt = await tx.wait();
+        // Determine oracle address based on capabilities
+        let oracleAddr = null;
+        if (card.capabilities?.includes("code-review") && REVIEWER_CONTRACT_ADDRESS) {
+            oracleAddr = REVIEWER_CONTRACT_ADDRESS;
+        } else if (card.capabilities?.includes("approve-pr") && APPROVER_CONTRACT_ADDRESS) {
+            oracleAddr = APPROVER_CONTRACT_ADDRESS;
+        }
+
+        let tx, receipt;
+        if (oracleAddr) {
+            // register(string agentURI, MetadataEntry[] metadata, address oracleAddress)
+            tx = await identity.connect(owner)["register(string,(string,bytes)[],address)"](
+                uri, [], oracleAddr
+            );
+        } else {
+            // register(string agentURI) — no oracle binding
+            tx = await identity.connect(owner)["register(string)"](uri);
+        }
+        receipt = await tx.wait();
 
         const event = receipt.logs
             .map(log => { try { return identity.interface.parseLog(log); } catch { return null; } })
             .find(e => e?.name === "Registered");
 
         const agentId = event?.args?.agentId ?? "?";
-        console.log(`✓ ${file.padEnd(12)} agentId=${agentId}  owner=${owner.address}`);
+        const oracleNote = oracleAddr ? `oracle=${oracleAddr}` : "no oracle";
+        console.log(`✓ ${file.padEnd(12)} agentId=${agentId}  owner=${owner.address}  ${oracleNote}`);
     }
 }
 

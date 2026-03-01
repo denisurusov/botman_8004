@@ -150,8 +150,10 @@ const TOOLS = {
     },
     // async handler — resolved in the HTTP layer
     handler: async (params) => {
-      const { pr_id, reviewer_agent, message } = params;
+      const { pr_id, reviewer_agent, message, trace_id } = params;
       if (!pr_id) throw new Error('pr_id is required');
+      const traceId = trace_id || 'unknown';
+      console.log(`[${agentName}] [${traceId}] approve_pr pr_id=${pr_id} reviewer=${reviewer_agent || 'none'}`);
 
       const comments = await fetchReviewComments(reviewer_agent, pr_id);
 
@@ -193,8 +195,9 @@ const TOOLS = {
       required: ['pr_id', 'reason'],
     },
     handler: (params) => {
-      const { pr_id, reason } = params;
+      const { pr_id, reason, trace_id } = params;
       if (!pr_id || !reason) throw new Error('pr_id and reason are required');
+      console.log(`[${agentName}] [${trace_id || 'unknown'}] reject_pr pr_id=${pr_id}`);
       const result = { pr_id, decision: 'rejected', reason, unresolved_blockers: [] };
       decisionStore.set(pr_id, { ...result, decidedAt: Date.now() });
       return result;
